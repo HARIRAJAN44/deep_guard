@@ -1,0 +1,45 @@
+# DeepGuard .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.egg-info/
+.env
+*.h5
+*.pkl
+*.pth
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+uploads/
+
+# Node / Frontend
+node_modules/
+dist/
+.env.local
+.env.production
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Secrets
+*.pem
+*.key
+*.cert
+
+# Logs
+*.log
+logs/
