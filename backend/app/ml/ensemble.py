@@ -68,6 +68,8 @@ def run_ensemble(image_bytes: bytes, registry: ModelRegistry) -> EnsembleResult:
     raw_scores: list[float] = []
     models_available = 0
 
+    logger.info("Starting ML ensemble inference on %d models...", len(registry.all_keys()))
+
     for key in registry.all_keys():
         loaded = registry.get(key)
         if not loaded:
@@ -81,6 +83,7 @@ def run_ensemble(image_bytes: bytes, registry: ModelRegistry) -> EnsembleResult:
                 score=0.5,
                 status="unavailable",
             )
+            logger.warning("  %s → SKIPPED (not loaded)", loaded.display_name)
             continue
 
         try:
@@ -94,7 +97,7 @@ def run_ensemble(image_bytes: bytes, registry: ModelRegistry) -> EnsembleResult:
                 status="success",
             )
             raw_scores.append(raw_score)
-            logger.debug("  %s → score=%.4f label=%s", loaded.display_name, raw_score, label)
+            logger.info("  ✓ %s → score=%.4f (%s)", loaded.display_name, raw_score, label)
         except Exception as exc:
             logger.error("Model '%s' inference failed: %s", loaded.display_name, exc)
             model_scores[key] = ModelScore(

@@ -1,5 +1,5 @@
 """
-OTP Service -- generate, store (hashed), verify, and resend OTPs (MySQL).
+OTP Service -- generate, store (hashed), verify, and resend OTPs (in-memory store).
 
 Development mode: OTP is printed to the console.
 Production mode: OTP is sent via SMTP.
@@ -12,11 +12,14 @@ from email.mime.text import MIMEText
 from typing import Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, update, delete
 
 from app.config import get_settings
-from app.database import get_session_factory
-from app.orm_models import OTPVerificationORM
+from app.db.memory_store import (
+    get_otp,
+    upsert_otp,
+    increment_otp_attempts,
+    delete_otp,
+)
 from app.utils.security import generate_otp, hash_otp, verify_otp
 
 logger = logging.getLogger(__name__)
@@ -28,64 +31,31 @@ async def send_otp(email: str, purpose: str = "email_verification") -> None:
     Replaces any existing OTP for this email+purpose.
     """
     settings = get_settings()
-    factory = get_session_factory()
 
-    async with factory() as session:
-        # Check resend cooldown
-        result = await session.execute(
-            select(OTPVerificationORM).where(
-                OTPVerificationORM.email == email.lower(),
-                OTPVerificationORM.purpose == purpose,
+    # Check resend cooldown
+    existing = get_otp(email, purpose)
+
+    if existing:
+        created = existing["created_at"]
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        cooldown = timedelta(seconds=settings.otp_resend_cooldown_seconds)
+        elapsed = datetime.now(timezone.utc) - created
+        if elapsed < cooldown:
+            remaining = int((cooldown - elapsed).total_seconds())
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "code": "OTP_COOLDOWN",
+                    "message": f"Please wait {remaining} seconds before requesting a new OTP.",
+                },
             )
-        )
-        existing = result.scalar_one_or_none()
 
-        if existing:
-            created = existing.created_at
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            cooldown = timedelta(seconds=settings.otp_resend_cooldown_seconds)
-            elapsed = datetime.now(timezone.utc) - created
-            if elapsed < cooldown:
-                remaining = int((cooldown - elapsed).total_seconds())
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail={
-                        "code": "OTP_COOLDOWN",
-                        "message": f"Please wait {remaining} seconds before requesting a new OTP.",
-                    },
-                )
+    otp = generate_otp()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.otp_expiration_minutes)
+    now = datetime.now(timezone.utc)
 
-        otp = generate_otp()
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.otp_expiration_minutes)
-        now = datetime.now(timezone.utc)
-
-        if existing:
-            # Update existing record
-            await session.execute(
-                update(OTPVerificationORM)
-                .where(
-                    OTPVerificationORM.email == email.lower(),
-                    OTPVerificationORM.purpose == purpose,
-                )
-                .values(
-                    otp_hash=hash_otp(otp),
-                    attempts=0,
-                    created_at=now,
-                    expires_at=expires_at,
-                )
-            )
-        else:
-            # Insert new record
-            session.add(OTPVerificationORM(
-                email=email.lower(),
-                purpose=purpose,
-                otp_hash=hash_otp(otp),
-                attempts=0,
-                created_at=now,
-                expires_at=expires_at,
-            ))
-        await session.commit()
+    upsert_otp(email, purpose, hash_otp(otp), expires_at)
 
     # Deliver the OTP
     if settings.otp_dev_mode:
@@ -110,74 +80,51 @@ async def verify_otp_code(email: str, otp_code: str, purpose: str = "email_verif
     Deletes the OTP record on success.
     """
     settings = get_settings()
-    factory = get_session_factory()
+    otp_row = get_otp(email, purpose)
 
-    async with factory() as session:
-        result = await session.execute(
-            select(OTPVerificationORM).where(
-                OTPVerificationORM.email == email.lower(),
-                OTPVerificationORM.purpose == purpose,
-            )
+    if not otp_row:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "OTP_NOT_FOUND", "message": "No pending OTP found. Please request a new one."},
         )
-        otp_row = result.scalar_one_or_none()
 
-        if not otp_row:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"code": "OTP_NOT_FOUND", "message": "No pending OTP found. Please request a new one."},
-            )
-
-        # Check expiry
-        expires_at = otp_row.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) > expires_at:
-            await session.execute(
-                delete(OTPVerificationORM).where(OTPVerificationORM.id == otp_row.id)
-            )
-            await session.commit()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"code": "OTP_EXPIRED", "message": "The OTP has expired. Please request a new one."},
-            )
-
-        # Check attempt limit
-        attempts = otp_row.attempts
-        if attempts >= settings.otp_max_attempts:
-            await session.execute(
-                delete(OTPVerificationORM).where(OTPVerificationORM.id == otp_row.id)
-            )
-            await session.commit()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "OTP_MAX_ATTEMPTS",
-                    "message": "Too many incorrect attempts. Please request a new OTP.",
-                },
-            )
-
-        # Verify
-        if not verify_otp(otp_code, otp_row.otp_hash):
-            await session.execute(
-                update(OTPVerificationORM)
-                .where(OTPVerificationORM.id == otp_row.id)
-                .values(attempts=OTPVerificationORM.attempts + 1)
-            )
-            await session.commit()
-            remaining = settings.otp_max_attempts - attempts - 1
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "INVALID_OTP",
-                    "message": f"Incorrect OTP. {remaining} attempt(s) remaining.",
-                },
-            )
-
-        # Success -- delete OTP record
-        await session.execute(
-            delete(OTPVerificationORM).where(OTPVerificationORM.id == otp_row.id)
+    # Check expiry
+    expires_at = otp_row["expires_at"]
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires_at:
+        delete_otp(email, purpose)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "OTP_EXPIRED", "message": "The OTP has expired. Please request a new one."},
         )
-        await session.commit()
+
+    # Check attempt limit
+    attempts = otp_row["attempts"]
+    if attempts >= settings.otp_max_attempts:
+        delete_otp(email, purpose)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "OTP_MAX_ATTEMPTS",
+                "message": "Too many incorrect attempts. Please request a new OTP.",
+            },
+        )
+
+    # Verify
+    if not verify_otp(otp_code, otp_row["otp_hash"]):
+        increment_otp_attempts(email, purpose)
+        remaining = settings.otp_max_attempts - attempts - 1
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "INVALID_OTP",
+                "message": f"Incorrect OTP. {remaining} attempt(s) remaining.",
+            },
+        )
+
+    # Success -- delete OTP record
+    delete_otp(email, purpose)
 
     logger.info("OTP verified successfully for %s [%s]", email, purpose)
 

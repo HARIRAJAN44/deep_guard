@@ -1,5 +1,5 @@
 """
-Health check endpoint (MySQL).
+Health check endpoint (in-memory store).
 """
 from fastapi import APIRouter
 
@@ -27,17 +27,8 @@ async def health():
         models_ok = False
         model_status = {"error": "models_not_loaded"}
 
-    # DB status -- try a lightweight query via SQLAlchemy
-    from app.database import get_session_factory
-    db_ok = False
-    try:
-        from sqlalchemy import text
-        factory = get_session_factory()
-        async with factory() as session:
-            await session.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception:
-        pass
+    # DB status -- in-memory store is always available
+    db_ok = True
 
     overall = "healthy" if (db_ok and models_ok) else "degraded"
 
